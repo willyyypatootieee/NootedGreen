@@ -1,0 +1,88 @@
+name: build-kexts
+
+# Builds NootedGreen.kext + HookCase.kext on a macOS Intel runner and uploads
+# them as downloadable artifacts. No local Xcode needed.
+#
+# NOTE: NootedGreen is x86_64-only (kexts must be Intel). Use an INTEL macOS
+# runner (macos-15-intel / macos-14-large), NOT the arm64 ones.
+#
+# Trigger: push, pull request, or manual "Run workflow".
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # Intel x64 macOS runner (kexts are x86_64). Fall back to macos-14-large if needed.
+    runs-on: macos-15-intel
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          uname -m
+          xcodebuild -version
+          xcodebuild -showsdks | head
+
+      - name: Build NootedGreen (Release)
+        run: |
+          xcodebuild \
+            -project NootedGreen.xcodeproj \
+            -scheme NootedGreen \
+            -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/dd" \
+            ARCHS=x86_64 ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Build HookCase (Release)
+        run: |
+          cd HookCase-master
+          xcodebuild \
+            -project HookCase.xcodeproj \
+            -scheme HookCase \
+            -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/dd-hc" \
+            ARCHS=x86_64 ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Collect products
+        run: |
+          set -e
+          mkdir -p out
+          # NootedGreen is the one we care about; HookCase too.
+          NG=$(find "$RUNNER_TEMP/dd" -name "NootedGreen.kext" -type d | head -1)
+          HC=$(find "$RUNNER_TEMP/dd-hc" -name "HookCase.kext" -type d | head -1)
+          echo "NootedGreen.kext: $NG"
+          echo "HookCase.kext:    $HC"
+          [ -n "$NG" ] && cp -R "$NG" out/
+          [ -n "$HC" ] && cp -R "$HC" out/
+          # Bundle the TGL drivers + bundles the installer expects (from repo).
+          cp -R sle_Internal out/sle_Internal 2>/dev/null || true
+          echo "--- out/ ---"
+          ls -la out/
+          [ -d out/NootedGreen.kext ] || { echo "NootedGreen.kext NOT produced"; exit 1; }
+
+      - name: Verify kext arch
+        run: |
+          for k in out/*.kext; do
+            [ -d "$k" ] || continue
+            echo "== $k =="
+            find "$k" -type f -perm -u+x | while read -r bin; do
+              file "$bin" | head -1
+            done
+          done
+
+      - name: Upload NootedGreen artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: NootedGreen-kexts
+          path: out/
+          if-no-files-found: error
+          retention-days: 30
