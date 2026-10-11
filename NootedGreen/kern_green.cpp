@@ -144,8 +144,44 @@ static void seedIGPUPropertiesEarly() {
 	}
 }
 
+/*
+ * ADL-P port diagnostics
+ *
+ * These switches deliberately split the three operations that previously ran
+ * as one opaque early-init block.  They are OFF by default and therefore do
+ * not alter the normal NootedGreen path.
+ *
+ * They exist because this Yoga's Sonoma 23J631 boot stops before any Gen11
+ * framebuffer/HW callback is observable.  A test build must be able to prove
+ * whether the stop is kernel routing, DeviceInfo discovery, or Lilu's PCI
+ * switch-off pass before we attempt another graphics bring-up.
+ */
+static bool adlpPortDiagnosticEnabled(const char *argument) {
+	return checkKernelArgument(argument);
+}
+
+static void adlpPortTrace(const char *checkpoint) {
+	if (adlpPortDiagnosticEnabled("-ngreeninittrace")) {
+		SYSLOG("ADLP", "INIT checkpoint: %s", checkpoint);
+	}
+}
+
+bool NGreen::allowRaptorLakeCompatibilityWorkarounds() const {
+	if (isRaptorLakeP()) {
+		return true;
+	}
+
+	/*
+	 * Some early experiments need to compare an ADL-P boot with the legacy
+	 * RPL-P workaround set.  Never make that inheritance implicit: it was the
+	 * source of V212 and deviceStart being routed on ADL-P without evidence.
+	 */
+	return isAlderLakeP() && checkKernelArgument("-ngreenrplcompat");
+}
+
 void NGreen::init() {
     callback = this;
+	adlpPortTrace("init-enter");
 	
 	lilu.onKextLoadForce(&kextAGDP);
 	/*lilu.onKextLoadForce(&kextBacklight);
@@ -157,6 +193,7 @@ void NGreen::init() {
 	gen11.init();
 	//agfxhda.init();
 	dyldpatches.init();
+	adlpPortTrace("init-hooks-registered");
 	
     lilu.onPatcherLoadForce(
         [](void *user, KernelPatcher &patcher) { static_cast<NGreen *>(user)->processPatcher(patcher); }, this);
@@ -164,21 +201,24 @@ void NGreen::init() {
         nullptr, 0,
         [](void *user, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
             static_cast<NGreen *>(user)->processKext(patcher, index, address, size);
-        },
-        this);
-	
+		},
+		this);
+	adlpPortTrace("init-complete");
 }
 
 
 void NGreen::processPatcher(KernelPatcher &patcher) {
+	adlpPortTrace("patcher-enter");
 	// Hook _cs_validate_page FIRST — before DeviceInfo which blocks
 	// for >60s polling PEGP (NVIDIA dGPU) disable via processSwitchOff.
 	// Without this, WindowServer starts before the hook is established
 	// and CoreDisplay loads unpatched from the shared cache.
-	if (!checkKernelArgument("-nbdyldoff")) {
+	if (!checkKernelArgument("-nbdyldoff") && !adlpPortDiagnosticEnabled("-ngreenskipdyld")) {
+		adlpPortTrace("before-dyld-route");
 		dyldpatches.processPatcher(patcher);
+		adlpPortTrace("after-dyld-route");
 	} else {
-		DBGLOG("ngreen", "DYLD patches disabled by boot argument -nbdyldoff");
+		SYSLOG("ADLP", "DYLD routing skipped by diagnostic boot argument");
 	}
 
 	// Compatibility-first default: do not force-inject IGPU properties unless explicitly requested.
@@ -188,9 +228,23 @@ void NGreen::processPatcher(KernelPatcher &patcher) {
 		SYSLOG("ngreen", "compat mode: legacy IGPU property seeding disabled (use -ngreenforceprops to enable)");
 	}
 
-    auto *devInfo = DeviceInfo::create();
+	if (adlpPortDiagnosticEnabled("-ngreenskipdeviceinfo")) {
+		SYSLOG("ADLP", "DeviceInfo path skipped by diagnostic boot argument");
+		adlpPortTrace("patcher-complete-no-deviceinfo");
+		return;
+	}
+
+	adlpPortTrace("before-deviceinfo-create");
+	auto *devInfo = DeviceInfo::create();
+	adlpPortTrace("after-deviceinfo-create");
     if (devInfo) {
-        devInfo->processSwitchOff();
+		if (!adlpPortDiagnosticEnabled("-ngreenskipswitchoff")) {
+			adlpPortTrace("before-process-switchoff");
+			devInfo->processSwitchOff();
+			adlpPortTrace("after-process-switchoff");
+		} else {
+			SYSLOG("ADLP", "DeviceInfo::processSwitchOff skipped by diagnostic boot argument");
+		}
 		
 		
 
@@ -262,8 +316,9 @@ void NGreen::processPatcher(KernelPatcher &patcher) {
             if (family == 0x6) model |= (extModel << 4);
             this->cpuModel = model;
             this->isRealTGL = (model == 0x8C || model == 0x8D);
-            SYSLOG("ngreen", "V52: CPU family=0x%x model=0x%x stepping=%u isRealTGL=%d",
-                   family, model, stepping, this->isRealTGL);
+			SYSLOG("ngreen", "V52: CPU family=0x%x model=0x%x stepping=%u isRealTGL=%d ADLP=%d RPLP=%d rplCompat=%d",
+			       family, model, stepping, this->isRealTGL, isAlderLakeP(), isRaptorLakeP(),
+			       allowRaptorLakeCompatibilityWorkarounds());
         }
 		
 		auto gms = WIOKit::readPCIConfigValue(devInfo->videoBuiltin, WIOKit::kIOPCIConfigGraphicsControl, 0, 16) >> 8;
@@ -290,11 +345,13 @@ void NGreen::processPatcher(KernelPatcher &patcher) {
 		KernelPatcher::routeVirtual(this->iGPU, WIOKit::PCIConfigOffset::ConfigRead32, configRead32, &orgConfigRead32);
 
         DeviceInfo::deleter(devInfo);
+		adlpPortTrace("patcher-complete");
 		
 
 		
     } else {
         SYSLOG("ngreen", "Failed to create DeviceInfo");
+		adlpPortTrace("patcher-complete-no-deviceinfo-result");
     }
 	
 	/*KernelPatcher::RouteRequest request {"__ZN15OSMetaClassBase12safeMetaCastEPKS_PK11OSMetaClass", wrapSafeMetaCast,
@@ -319,8 +376,8 @@ OSMetaClassBase *NGreen::wrapSafeMetaCast(const OSMetaClassBase *anObject, const
 
 bool NGreen::wrapIGAccelDeviceStart(void *that) {
 	auto ret = FunctionCast(wrapIGAccelDeviceStart, callback->orgIGAccelDeviceStart)(that);
-	if (!callback->isRealTGL && !ret) {
-		SYSLOG("NGreen", "IOAccelF2: forcing IGAccelDevice::deviceStart success on spoofed TGL path");
+	if (callback->allowRaptorLakeCompatibilityWorkarounds() && !ret) {
+		SYSLOG("NGreen", "IOAccelF2: forcing IGAccelDevice::deviceStart success on RPL compatibility path");
 		return true;
 	}
 	DBGLOG("NGreen", "IOAccelF2: IGAccelDevice::deviceStart returned %d", ret);
@@ -631,4 +688,3 @@ bool NGreen::wrapApplePanelSetDisplay(IOService *that, IODisplay *display) {
 	bool ret = FunctionCast(wrapApplePanelSetDisplay, callback->orgApplePanelSetDisplay)(that, display);
 	return ret;
 }
-

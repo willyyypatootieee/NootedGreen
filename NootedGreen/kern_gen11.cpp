@@ -1037,14 +1037,6 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		 	{"__ZN16IntelAccelerator19startGraphicsEngineEv", startGraphicsEngine, this->ostartGraphicsEngine},
 			{"__ZN16IntelAccelerator18stopGraphicsEngineEv",  stopGraphicsEngine,  this->ostopGraphicsEngine},
 
-			// V212: Hook IGScheduler{4,5}::isGpuIdle — the bool watchdog query called post-startup.
-			// startGraphicsEngine SUCCEEDS (returns non-zero = success path in decomp). But the GPU
-			// watchdog polls isGpuIdle() after init; INSTDONE bit0 stuck at 0 makes it return false
-			// → watchdog declares GPU hung → resets → startGraphicsEngine retry loop forever.
-			// Fix: when INSTDONE == 0xfffffffe (RPL-P idle with stuck bit0), return true.
-			{"__ZNK12IGScheduler59isGpuIdleEv", wrapIGScheduler5IsGpuIdle, this->oIGScheduler5IsGpuIdle},
-			{"__ZNK12IGScheduler49isGpuIdleEv", wrapIGScheduler4IsGpuIdle, this->oIGScheduler4IsGpuIdle},
-
 			// V164: Hook populateResetRegisterList which reads live MMIO values into the per-context
 			// replay list (a batch of MI_LRI commands executed before every context switch).
 			// startGraphicsEngine enables PERCTX_PREEMPT_CTRL then calls populateResetRegisterList,
@@ -1145,6 +1137,24 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, requests, address, size), "ngreen","Failed to route symbols");
 		SYSLOG("ngreen", "V165: HW accelerator symbols routed OK");
 
+		// V212 was derived from observed RPL-P watchdog behavior.  Do not route
+		// it on ADL-P simply because ADL-P is also not genuine TGL.  An ADL-P
+		// experiment can opt in with -ngreenrplcompat, and its log will prove it.
+		if (NGreen::callback->allowRaptorLakeCompatibilityWorkarounds()) {
+			RouteRequestPlus rplWatchdogRoutes[] = {
+				{"__ZNK12IGScheduler59isGpuIdleEv", wrapIGScheduler5IsGpuIdle, this->oIGScheduler5IsGpuIdle},
+				{"__ZNK12IGScheduler49isGpuIdleEv", wrapIGScheduler4IsGpuIdle, this->oIGScheduler4IsGpuIdle},
+			};
+			if (RouteRequestPlus::routeAll(patcher, index, rplWatchdogRoutes, address, size)) {
+				SYSLOG("ngreen", "V212: RPL watchdog routes enabled");
+			} else {
+				patcher.clearError();
+				SYSLOG("ngreen", "V212: RPL watchdog routes unavailable");
+			}
+		} else {
+			SYSLOG("ADLP", "V212 RPL watchdog routes intentionally disabled on ADL-P");
+		}
+
 		{
 			RouteRequestPlus startRoute[] = {
 				{"__ZN16IntelAccelerator5startEP9IOService", start, this->ostart},
@@ -1165,7 +1175,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, firmwareRoute, address, size), "ngreen", "Failed to route loadGuCBinary");
 		}
 
-		if (!NGreen::callback->isRealTGL) {
+		if (NGreen::callback->allowRaptorLakeCompatibilityWorkarounds()) {
 			// V111: Hook IGAccelDevice::deviceStart to force success on RPL.
 			// Binary pattern (f_devstart) may not match every Sonoma build variant.
 			// This symbol-based hook guarantees deviceStart returns true regardless of
@@ -1178,6 +1188,8 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			} else {
 				SYSLOG("ngreen", "V111: IGAccelDevice::deviceStart symbol not found — relying on binary patch");
 			}
+		} else if (NGreen::callback->isAlderLakeP()) {
+			SYSLOG("ADLP", "V111 RPL force-success hook intentionally disabled on ADL-P");
 		}
 
 		if (!wegCoexist || forceFullMTL) {

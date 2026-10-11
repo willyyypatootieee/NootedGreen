@@ -74,6 +74,13 @@ class NGreen {
 	
 	UInt32 stolen_size;
 	uint32_t framebufferId {0};
+
+	// CPU-family policy must distinguish ADL-P from the RPL-P system on which
+	// many experimental Gen12 workarounds were developed.  "not real TGL" is
+	// not a hardware family and must not itself select RPL-specific hooks.
+	bool isAlderLakeP() const { return cpuModel == 0x9A; }
+	bool isRaptorLakeP() const { return cpuModel == 0xBA; }
+	bool allowRaptorLakeCompatibilityWorkarounds() const;
 	
 	// Public MMIO register access (used by display link training, display merge, etc.)
 	UInt32 readReg32(unsigned long reg) {
@@ -280,7 +287,7 @@ class NGreen {
     bool isJslDerivative = false;
     bool isGen9LPDerivative = false;
     bool isGen8LPDerivative = false;
-    bool isRealTGL = false;  // true if CPU is genuine TGL (model 0x8C/0x8D), false if spoofed (RPL/ADL)
+	bool isRealTGL = false;  // true if CPU is genuine TGL (model 0x8C/0x8D), false if spoofed (RPL/ADL)
 public:
     bool getIsRealTGL() const { return isRealTGL; }
 private:
@@ -349,4 +356,3 @@ struct DPCDCap16 { // 16 bytes
 	// Detailed information can be found in the specification
 	uint8_t others[12] {};
 };
-
