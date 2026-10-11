@@ -78,8 +78,27 @@ unless that explicit comparison argument is supplied.
 
 ## Build boundary
 
-Linux is the evidence and source-analysis workstation.  A loadable macOS Lilu
-kext must still be built with a macOS SDK/Xcode toolchain, then validated by:
+Linux is the evidence and source-analysis workstation.  The repository includes
+an artifact-only GitHub Actions workflow at
+`.github/workflows/build-kext.yml` which uses a hosted macOS 14 runner to build
+the exact pushed commit. It is manually runnable from **Actions → Build
+diagnostic kext → Run workflow**, and also runs on changes pushed to
+`adlp-23j631-port`.
+
+The workflow deliberately does not have deployment credentials and cannot
+modify an EFI partition or a Mac. Its downloadable artifact contains:
+
+* `NootedGreen-ADLP-diagnostic.kext.zip`;
+* `SHA256SUMS.txt`; and
+* `BUILD-INFO.txt` with the immutable source commit, Actions run URL, Xcode
+  version, bundle identifier, and x86_64 architecture check.
+
+Only download an artifact whose `source_commit` is `91acf75` or a reviewed
+descendant and whose SHA-256 has been checked locally. Before a boot test it
+must still be installed as a separate diagnostic EFI kext, not over the known
+working desktop profile.
+
+The equivalent local macOS build command is:
 
 ```sh
 xcodebuild -project NootedGreen.xcodeproj -scheme NootedGreen -configuration Release

@@ -1,0 +1,94 @@
+name: Build diagnostic kext
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - adlp-23j631-port
+    paths:
+      - NootedGreen/**
+      - NootedGreen.xcodeproj/**
+      - Lilu.kext/**
+      - MacKernelSDK/**
+      - .github/workflows/build-kext.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: macOS / Release / x86_64
+    runs-on: macos-14
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out the exact source revision
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Display toolchain and source identity
+        run: |
+          set -euo pipefail
+          sw_vers
+          xcodebuild -version
+          git rev-parse HEAD
+          git status --short
+
+      - name: Build unsigned diagnostic kext
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/NootedGreen-build"
+          xcodebuild \
+            -project NootedGreen.xcodeproj \
+            -target NootedGreen \
+            -configuration Release \
+            -sdk macosx \
+            -arch x86_64 \
+            CODE_SIGN_IDENTITY=- \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CONFIGURATION_BUILD_DIR="$RUNNER_TEMP/NootedGreen-build" \
+            build
+
+      - name: Validate kext bundle and collect provenance
+        id: validate
+        env:
+          BUILD_DIR: ${{ runner.temp }}/NootedGreen-build
+        run: |
+          set -euo pipefail
+          kext="$BUILD_DIR/NootedGreen.kext"
+          binary="$kext/Contents/MacOS/NootedGreen"
+          test -d "$kext"
+          test -f "$binary"
+
+          plutil -lint "$kext/Contents/Info.plist"
+          file "$binary"
+          lipo -archs "$binary" | grep -Fx 'x86_64'
+          codesign -dvv "$kext" 2>&1 || true
+
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent "$kext" dist/NootedGreen-ADLP-diagnostic.kext.zip
+          shasum -a 256 dist/NootedGreen-ADLP-diagnostic.kext.zip | tee dist/SHA256SUMS.txt
+          {
+            echo "source_commit=$(git rev-parse HEAD)"
+            echo "source_ref=${GITHUB_REF}"
+            echo "source_run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo
+            echo '--- xcode ---'
+            xcodebuild -version
+            echo
+            echo '--- bundle ---'
+            /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$kext/Contents/Info.plist"
+            /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$kext/Contents/Info.plist"
+            file "$binary"
+            lipo -archs "$binary"
+          } > dist/BUILD-INFO.txt
+
+      - name: Upload diagnostic artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NootedGreen-ADLP-diagnostic-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
