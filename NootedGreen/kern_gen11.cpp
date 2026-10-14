@@ -278,6 +278,54 @@ static int getV77KillDelayIterations() {
 	return 60;
 }
 
+// Gen12 topology as consumed by the TGL accelerator binary. Xe-LP reports
+// dual sub-slices (DSS), while the donor counts two traditional sub-slices
+// (SS) per DSS. Keep this independent from display/DMC policy.
+//
+// The six-DSS fallback preserves the existing 96-EU RPL profile and matches
+// this ADL-P GT2's Linux i915 topology. A tester with a different, measured
+// Gen12 topology may supply ngreen-dss=N. Do not read topology fuses during
+// early bring-up: that requires render-domain forcewake and is a separate,
+// hardware-writing experiment.
+constexpr uint32_t NGreenGen12MaxDSS = 6;
+constexpr uint32_t NGreenGen12EUPerSS = 8;
+
+struct NGreenTopology {
+	uint32_t numSlices;
+	uint32_t dss;
+	uint32_t numSubSlices;
+	uint32_t maxEUPerSubSlice;
+	uint32_t totalEU;
+};
+
+static NGreenTopology resolveGen12Topology() {
+	uint32_t dss = NGreenGen12MaxDSS;
+	const char *source = "measured-default";
+	uint32_t overrideDss = 0;
+
+	if (PE_parse_boot_argn("ngreen-dss", &overrideDss, sizeof(overrideDss))) {
+		if (overrideDss >= 1 && overrideDss <= NGreenGen12MaxDSS) {
+			dss = overrideDss;
+			source = "boot-arg";
+		} else {
+			SYSLOG("ngreen", "topology: ignoring invalid ngreen-dss=%u (valid range 1..%u)",
+				overrideDss, NGreenGen12MaxDSS);
+		}
+	}
+
+	NGreenTopology topology {
+		1,
+		dss,
+		dss * 2,
+		NGreenGen12EUPerSS,
+		dss * 2 * NGreenGen12EUPerSS,
+	};
+	SYSLOG("ngreen", "topology (%s): dss=%u subslices=%u maxEU/SS=%u totalEU=%u",
+		source, topology.dss, topology.numSubSlices,
+		topology.maxEUPerSubSlice, topology.totalEU);
+	return topology;
+}
+
 bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
 	if (kextG11FB.loadIndex == index) {
 		if (this->tglFBLoaded) {
@@ -1005,15 +1053,44 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		this->tglHWLoaded = true;
 		auto *activeKext = (kextG11HWTA.loadIndex == index) ? &kextG11HWTA : &kextG11HWT;
 		SYSLOG("ngreen", "init AppleIntelTGLGraphics (HW accelerator)");
-		injectAcceleratorPersonality(true);
-		NGreen::callback->setRMMIOIfNecessary();
-		SYSLOG("ngreen", "V165: setRMMIO done, starting symbol resolve");
+		const bool rplCompatibility =
+			NGreen::callback->allowRaptorLakeCompatibilityWorkarounds();
+		const bool sequoiaAdlpBaseline = NGreen::callback->isAlderLakeP() &&
+			getKernelVersion() >= KernelVersion::Sequoia && !rplCompatibility;
+		/*
+		 * ADL-P / Sequoia accelerator-admission step.
+		 *
+		 * The normal diagnostic baseline deliberately withholds the synthetic
+		 * IntelAccelerator catalogue personality.  That proves donor-kext
+		 * admission, but leaves the accelerator without an IOKit provider, so
+		 * IORegistry contains only the generic IONDRV framebuffer and Metal has
+		 * no device to open.
+		 *
+		 * -ngreenadlpadmit restores ONLY the catalogue personality needed for
+		 * IOKit to instantiate IntelAccelerator. It is not an
+		 * alias for -ngreenrplcompat: the RPL context/blit/reset, deviceStart,
+		 * firmware, topology, and Sonoma binary-patch paths remain below in their
+		 * Sequoia baseline state.
+		 */
+		const bool adlpSequoiaAdmission = sequoiaAdlpBaseline &&
+			checkKernelArgument("-ngreenadlpadmit");
+		if (sequoiaAdlpBaseline && !adlpSequoiaAdmission) {
+			SYSLOG("ADLP", "Sequoia baseline: TGL accelerator reached; catalog personality and MMIO mapping withheld");
+		} else {
+			injectAcceleratorPersonality(true);
+			if (adlpSequoiaAdmission) {
+				SYSLOG("ADLP", "admission-only: TGL IntelAccelerator personality enabled; RPL recovery routes remain withheld");
+			} else {
+				NGreen::callback->setRMMIOIfNecessary();
+				SYSLOG("ngreen", "V165: setRMMIO done, starting symbol resolve");
+			}
+		}
 
 		// V144: Resolve the Blit3D context params struct and the ExtendedContext initWithOptions.
 		// Blit3DExtendedCtxParams is a static data symbol — address passed as param_2 to initWithOptions.
 		// Without these, IGHardwareExtendedContextinitWithOptions is called with param_2=0
 		// causing it to return 0 (ok=0) and leave ctx+0xb8=NULL → submitBlit crash at +0x28e.
-		{
+		if (!sequoiaAdlpBaseline) {
 			SolveRequestPlus solveRequests[] = {
 				{"__ZN23IGHardwareBlit3DContext17ExtendedCtxParamsE", this->Blit3DExtendedCtxParams},
 			};
@@ -1024,7 +1101,12 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		const bool wegCoexist = isWEGCoexistMode();
 		const bool forceFullMTL = shouldForceFullMetalPath();
 
-		RouteRequestPlus requests[] = {
+		if (!sequoiaAdlpBaseline) {
+			// These routes replace context creation, blit, reset, and recovery behaviour.
+			// They were derived from RPL observations, not from ADL-P.  Keep the ADL-P
+			// baseline on the donor's original implementation until a receipt identifies
+			// one exact incompatibility.
+			RouteRequestPlus requests[] = {
 			
 			 {"__ZN16IntelAccelerator20_PAVPCommandCallbackEP8OSObject22PAVPSessionCommandID_tjPj", wrapPavpSessionCallback, this->orgPavpSessionCallback},
 			
@@ -1132,15 +1214,18 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			 {"__ZN11IGAccelTask22getDepthResolveContextEb", getDepthResolveContext, this->ogetDepthResolveContext},
 			 {"__ZN11IGAccelTask22getColorResolveContextEb", getColorResolveContext, this->ogetColorResolveContext},
 			 
-		 };
-		SYSLOG("ngreen", "V165: routing %zu HW accelerator symbols", sizeof(requests)/sizeof(requests[0]));
-		PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, requests, address, size), "ngreen","Failed to route symbols");
-		SYSLOG("ngreen", "V165: HW accelerator symbols routed OK");
+			};
+			SYSLOG("ngreen", "V165: routing %zu RPL accelerator-recovery symbols", sizeof(requests)/sizeof(requests[0]));
+			PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, requests, address, size), "ngreen", "Failed to route RPL accelerator-recovery symbols");
+			SYSLOG("ngreen", "V165: RPL accelerator-recovery symbols routed OK");
+		} else {
+			SYSLOG("ADLP", "RPL context/blit/reset recovery routes intentionally disabled on Sequoia baseline");
+		}
 
 		// V212 was derived from observed RPL-P watchdog behavior.  Do not route
 		// it on ADL-P simply because ADL-P is also not genuine TGL.  An ADL-P
 		// experiment can opt in with -ngreenrplcompat, and its log will prove it.
-		if (NGreen::callback->allowRaptorLakeCompatibilityWorkarounds()) {
+		if (rplCompatibility) {
 			RouteRequestPlus rplWatchdogRoutes[] = {
 				{"__ZNK12IGScheduler59isGpuIdleEv", wrapIGScheduler5IsGpuIdle, this->oIGScheduler5IsGpuIdle},
 				{"__ZNK12IGScheduler49isGpuIdleEv", wrapIGScheduler4IsGpuIdle, this->oIGScheduler4IsGpuIdle},
@@ -1151,11 +1236,20 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				patcher.clearError();
 				SYSLOG("ngreen", "V212: RPL watchdog routes unavailable");
 			}
-		} else {
-			SYSLOG("ADLP", "V212 RPL watchdog routes intentionally disabled on ADL-P");
+		} else if (NGreen::callback->isAlderLakeP()) {
+			SYSLOG("ADLP", sequoiaAdlpBaseline
+				? "V212 RPL watchdog routes intentionally disabled on Sequoia baseline"
+				: "V212 RPL watchdog routes intentionally disabled on ADL-P");
 		}
 
-		{
+		/*
+		 * Gen11::start contains legacy non-TGL MMIO/reset/IRQ experiments.  The
+		 * admission-only profile is specifically intended to find out whether the
+		 * donor can attach natively once IOKit has a valid personality; it must
+		 * not execute that wrapper.  Keep the wrapper for the existing non-baseline
+		 * profiles, whose opt-in recovery paths were written around it.
+		 */
+		if (!sequoiaAdlpBaseline) {
 			RouteRequestPlus startRoute[] = {
 				{"__ZN16IntelAccelerator5startEP9IOService", start, this->ostart},
 			};
@@ -1164,18 +1258,25 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			} else {
 				SYSLOG("ngreen", "V44: IntelAccelerator::start symbol not found; Gen11::start logs unavailable on this build");
 			}
+		} else if (adlpSequoiaAdmission) {
+			SYSLOG("ADLP", "admission-only: IntelAccelerator::start left native; legacy non-TGL MMIO/reset/IRQ wrapper withheld");
+		} else {
+			SYSLOG("ADLP", "IntelAccelerator::start wrapper withheld on Sequoia baseline");
 		}
 
-		{
+		if (!sequoiaAdlpBaseline) {
 			// loadGuCBinary: always route — WEG's firmware path is Mojave-gated and dead on Sonoma.
-			// Without this hook, no GuC binary loads at all in coexist mode → ring dead.
+			// The legacy route stubs firmware load to force host scheduling. Sequoia
+			// ADL-P retains the donor's original firmware decision in the baseline.
 			RouteRequestPlus firmwareRoute[] = {
 				{"__ZN13IGHardwareGuC13loadGuCBinaryEv", loadGuCBinary, this->oloadGuCBinary},
 			};
 			PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, firmwareRoute, address, size), "ngreen", "Failed to route loadGuCBinary");
+		} else {
+			SYSLOG("ADLP", "RPL GuC host-scheduling stub intentionally disabled on Sequoia baseline");
 		}
 
-		if (NGreen::callback->allowRaptorLakeCompatibilityWorkarounds()) {
+		if (rplCompatibility) {
 			// V111: Hook IGAccelDevice::deviceStart to force success on RPL.
 			// Binary pattern (f_devstart) may not match every Sonoma build variant.
 			// This symbol-based hook guarantees deviceStart returns true regardless of
@@ -1189,10 +1290,12 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				SYSLOG("ngreen", "V111: IGAccelDevice::deviceStart symbol not found — relying on binary patch");
 			}
 		} else if (NGreen::callback->isAlderLakeP()) {
-			SYSLOG("ADLP", "V111 RPL force-success hook intentionally disabled on ADL-P");
+			SYSLOG("ADLP", sequoiaAdlpBaseline
+				? "V111 RPL force-success hook intentionally disabled on Sequoia baseline"
+				: "V111 RPL force-success hook intentionally disabled on ADL-P");
 		}
 
-		if (!wegCoexist || forceFullMTL) {
+		if (!sequoiaAdlpBaseline && (!wegCoexist || forceFullMTL)) {
 			RouteRequestPlus coexistOffRoutes[] = {
 				// ForceWake: replace Apple's SafeForceWakeMultithreaded with i915-ported version.
 				// Apple's code uses 90ms timeouts and no fallback; ours uses 50ms + reserve-bit fallback.
@@ -1256,12 +1359,12 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		// NumSubSlices override (verified @ 0x28654 in LE binary)
 		// Original: mov ebx,[rbp-0x30]; popcnt esi,ebx; add esi,esi; mov [r15+0x1158],esi
 		//           → NumSubSlices = popcount(subsliceMask) * 2  (hardware-detected)
-		// Patch:    hardcodes NumSubSlices=12 for RPL 96EU (6 DSS × 2 SS/DSS = 12 SS).
-		//           Linux i915: subslice total=6 mask=0x3f, so 6 DSS doubled to 12 SS.
+		// Patch:    supplies 2 x DSS. The immediate is set from the bounded
+		//           topology selection immediately before the patch is applied.
 		static const uint8_t f3bbb[] = {//NumSubSlices
 			0x8b, 0x5d, 0xd0, 0xf3, 0x0f, 0xb8, 0xf3, 0x01, 0xf6, 0x41, 0x89, 0xb7, 0x58, 0x11, 0x00, 0x00
 		};
-		static const uint8_t r3bbb[] = {
+		static uint8_t r3bbb[] = {
 			0x8b, 0x5d, 0xd0, 0xbe, 0x0c, 0x00, 0x00, 0x00, 0x90, 0x41, 0x89, 0xb7, 0x58, 0x11, 0x00, 0x00
 		};
 		
@@ -1404,10 +1507,10 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			0x0f, 0xc6, 0xcc, 0xc6, 0x41, 0x0f, 0x11, 0x49, 0x20, 0x0f, 0xc6, 0xdc, 0x4e
 		};
 
-		{
-			// V52: Split patches into always-apply and RPL-only groups.
-			// Real TGL reads topology from fuses correctly; RPL must hardcode
-			// because fuse layout differs and BCS ring doesn't start.
+		if (!sequoiaAdlpBaseline) {
+			// Real TGL reads its own topology. Spoofed Gen12 parts need the
+			// donor-visible topology supplied explicitly, but ADL-P must not
+			// thereby inherit RPL's BCS/device-start workaround set.
 			LookupPatchPlus const patchesAlways[] = {
 				// SKU/device-ID bypass — needed for both (0x9A49 not in whitelist)
 				{activeKext, f3, r3, arrsize(f3),	1},
@@ -1416,15 +1519,32 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				"kextG11HWT Failed to apply base patches!");
 			
 			if (!NGreen::callback->isRealTGL) {
-				// RPL-only: hardcode topology and bypass BCS readiness check
-				LookupPatchPlus const patchesRPL[] = {
+				// Topology-only admission for all spoofed Gen12 systems.
+				const auto topology = resolveGen12Topology();
+				r3bbb[4] = static_cast<uint8_t>(topology.numSubSlices);
+				LookupPatchPlus const topologyPatches[] = {
 					{activeKext, f3b, r3b, arrsize(f3b),	1},      // L3BankCount=8
 					{activeKext, f3bb, r3bb, arrsize(f3bb),	1},    // MaxEU/SS=8
-					{activeKext, f3bbb, r3bbb, arrsize(f3bbb),	1},// NumSubSlices=12
-					{activeKext, f_devstart, m_devstart, r_devstart, rm_devstart, arrsize(f_devstart), 1}, // BCS bypass
+					{activeKext, f3bbb, r3bbb, arrsize(f3bbb),	1},// NumSubSlices (bounded topology)
 				};
-				PANIC_COND(!LookupPatchPlus::applyAll(patcher, patchesRPL, address, size), "ngreen",
-					"kextG11HWT Failed to apply RPL-specific patches!");
+				PANIC_COND(!LookupPatchPlus::applyAll(patcher, topologyPatches, address, size), "ngreen",
+					"kextG11HWT Failed to apply spoofed-Gen12 topology patches!");
+				SYSLOG("ngreen", "V52: Applied spoofed-Gen12 bounded topology patches");
+
+				if (!NGreen::callback->allowRaptorLakeCompatibilityWorkarounds()) {
+					if (NGreen::callback->isAlderLakeP()) {
+						SYSLOG("ADLP", "RPL BCS/device-start and blit workarounds intentionally disabled");
+					}
+				} else {
+					// RPL-only BCS readiness bypass. ADL-P may enable this only for
+					// an explicit comparison using -ngreenrplcompat.
+					LookupPatchPlus const rplBcsPatch {
+						activeKext, f_devstart, m_devstart, r_devstart, rm_devstart,
+						arrsize(f_devstart), 1
+					};
+					PANIC_COND(!rplBcsPatch.apply(patcher, address, size), "ngreen",
+						"kextG11HWT Failed to apply RPL BCS readiness patch!");
+					SYSLOG("ngreen", "V52: Applied RPL BCS readiness patch");
 
 				// Optional secondary signature for Sonoma variants with long JE encoding.
 				/*LookupPatchPlus const patchRPLDevstartLong {
@@ -1610,15 +1730,17 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				v140Applied += patchV140Case4Store20.apply(patcher, address, size) ? 1 : 0;
 				SYSLOG("ngreen", "V140: contextual blit3d store mitigation applied %d/4 signatures", v140Applied);
 
-				SYSLOG("ngreen", "V52: Applied RPL-specific patches (topology hardcode + BCS bypass)");
+				}
 			} else {
-				SYSLOG("ngreen", "V52: Real TGL — skipping topology hardcodes and BCS bypass");
+				SYSLOG("ngreen", "V52: Real TGL — skipping spoofed-Gen12 topology and RPL BCS patches");
 			}
+		} else {
+			SYSLOG("ADLP", "Sonoma-only TGL accelerator binary patches withheld on Sequoia baseline");
 		}
 
 		SYSLOG("ngreen", "Loaded AppleIntelTGLGraphics! %s",
 			   NGreen::callback->isRealTGL ? "Real TGL — native topology" :
-			   "RPL spoofed — slices=1 subslices=12(6DSS) maxEU/SS=8 totalEU=96 L3=8");
+			   "Spoofed Gen12 — bounded topology selected separately");
 
 		return true;
 	}
@@ -4958,11 +5080,17 @@ void Gen11::getGPUInfo(void *that)
 #define   GEN10_RPM_CONFIG0_CTC_SHIFT_PARAMETER_MASK	(0x3 << GEN10_RPM_CONFIG0_CTC_SHIFT_PARAMETER_SHIFT)
 	
 	FunctionCast(getGPUInfo, callback->ogetGPUInfo)(that);
+	if (NGreen::callback->isAlderLakeP() &&
+		getKernelVersion() >= KernelVersion::Sequoia &&
+		!NGreen::callback->allowRaptorLakeCompatibilityWorkarounds()) {
+		SYSLOG("ADLP", "getGPUInfo: donor topology left unmodified on Sequoia baseline");
+		return;
+	}
 
-	// --- GPU topology override for RPL i7-13700H (verified from Linux i915 syslog) ---
-	// Linux i915 reports: 1 slice, 6 DSS (mask=0x3f), 16 EU/DSS, 96 EU total.
-	// TGL binary uses traditional sub-slices (SS), not dual sub-slices (DSS):
-	//   6 DSS × 2 SS/DSS = 12 SS,  16 EU/DSS / 2 = 8 EU/SS, 12 × 8 = 96 EU.
+	// --- GPU topology override for RPL compatibility comparisons ---
+	// The TGL binary uses traditional sub-slices (SS), not dual sub-slices
+	// (DSS): one DSS is two SS. resolveGen12Topology() preserves the measured
+	// 6-DSS/96-EU fallback and accepts only a bounded explicit override.
 	// Object layout (byte offsets from `this`, verified via disassembly):
 	//   0x115c = NumSlices          0x0dd8 = NumSlices mirror
 	//   0x1158 = NumSubSlices       0x0ddc = NumSubSlices mirror
@@ -4970,10 +5098,11 @@ void Gen11::getGPUInfo(void *that)
 	//   0x1124 = ExecutionUnitCount (= MaxEUPerSubSlice × NumSubSlices)
 	//   0x1150 = Frequency pair (low32=fMaxMHz, high32=fMinMHz)
 	//   0x1164 = L3BankCount
-	unsigned int numSlices        = 1;
-	unsigned int numSubSlices     = 12;  // 6 DSS × 2 = 12 traditional SS
-	unsigned int maxEUPerSubSlice = 8;   // 16 EU/DSS ÷ 2 SS/DSS = 8 EU/SS
-	unsigned int totalEU          = maxEUPerSubSlice * numSubSlices; // = 96
+	const auto topology = resolveGen12Topology();
+	unsigned int numSlices        = topology.numSlices;
+	unsigned int numSubSlices     = topology.numSubSlices;
+	unsigned int maxEUPerSubSlice = topology.maxEUPerSubSlice;
+	unsigned int totalEU          = topology.totalEU;
 	
 	getMember<UInt32>(that, 0x115c) = numSlices;
 	getMember<UInt32>(that, 0x1158) = numSubSlices;
@@ -5003,7 +5132,8 @@ void Gen11::getGPUInfo(void *that)
 // making the replay batch write 0x0000 to 0x20E0 on every context switch instead.
 void Gen11::populateResetRegisterList(void *that)
 {
-	if (!NGreen::callback->isRealTGL) {
+	const bool rplCompatibility = NGreen::callback->allowRaptorLakeCompatibilityWorkarounds();
+	if (rplCompatibility) {
 		// Masked clear: mask=bit14, value=0 → 0x40000000
 		NGreen::callback->writeReg32(GEN7_FF_SLICE_CS_CHICKEN1,
 			(GEN9_FFSC_PERCTX_PREEMPT_CTRL << 16) | 0);
@@ -5012,11 +5142,17 @@ void Gen11::populateResetRegisterList(void *that)
 
 	}
 	FunctionCast(populateResetRegisterList, callback->opopulateResetRegisterList)(that);
+	if (!rplCompatibility) {
+		if (NGreen::callback->isAlderLakeP()) {
+			SYSLOG("ADLP", "RPL reset-list mutations intentionally disabled");
+		}
+		return;
+	}
 
 	// V503: Dump the exact values Apple just baked into the context reset register list.
 	// Register set decoded from Ghidra decompile of IntelAccelerator::populateResetRegisterList.
 	static bool v503Logged = false;
-	if (!v503Logged && !NGreen::callback->isRealTGL) {
+	if (!v503Logged) {
 		v503Logged = true;
 		auto *cb = NGreen::callback;
 		SYSLOG("ngreen", "V503: context register snapshot (19 regs):");
@@ -5042,7 +5178,7 @@ void Gen11::populateResetRegisterList(void *that)
 	}
 	// V504: patch reset register list before context image bakes
 	// Walk IGVector: each entry = {uint32_t mmio_addr, uint32_t value, char name[0x1c]}
-	if (!NGreen::callback->isRealTGL) {
+	{
 		auto *accel = reinterpret_cast<AppleIntel::IntelAccelerator*>(that);
 		uint64_t count = accel->fResetRegCount;
 		uint8_t *data  = reinterpret_cast<uint8_t*>(accel->fResetRegData);
@@ -5094,7 +5230,7 @@ void Gen11::populateResetRegisterList(void *that)
 	// so the slot gets wiped by stopGraphicsEngine and never repaired by V508.
 	auto *cb = NGreen::callback;
 	void *ctx = cb->lastRCSCtx;
-	if (!cb->isRealTGL && ctx) {
+	if (ctx) {
 		uint32_t lrcaGpuVa = getMember<uint32_t>(ctx, 0x89) & 0xFFFFF000;
 		if (lrcaGpuVa) {
 			uint32_t ctxPage1Idx = (lrcaGpuVa >> 12) + 1;
@@ -5555,15 +5691,16 @@ void Gen11::IGHardwareBlit3DContextinitialize(void *that)
 unsigned long Gen11::startGraphicsEngine(void *that)
 {
 	static int startCount = 0;
+	const bool rplCompatibility = NGreen::callback->allowRaptorLakeCompatibilityWorkarounds();
 
-	if (!NGreen::callback->isRealTGL) {
+	if (rplCompatibility) {
 		startCount++;
 		applyPreStartEngineWorkarounds(startCount);
 	}
 
 	unsigned long ret = FunctionCast(startGraphicsEngine, callback->ostartGraphicsEngine)(that);
 
-	if (!NGreen::callback->isRealTGL) {
+	if (rplCompatibility) {
 		// Masked clear: mask=bit14, value=0 → 0x40000000
 		NGreen::callback->writeReg32(GEN7_FF_SLICE_CS_CHICKEN1,
 			(GEN9_FFSC_PERCTX_PREEMPT_CTRL << 16) | 0);
@@ -5654,8 +5791,9 @@ unsigned long Gen11::stopGraphicsEngine(void *that)
 	static uint32_t v155SavedRcsCtl       = 0;
 	static int   v164GdrstCount           = 0;
 	static int   v505Count                = 0;
+	const bool rplCompatibility = NGreen::callback->allowRaptorLakeCompatibilityWorkarounds();
 
-	if (!NGreen::callback->isRealTGL) {
+	if (rplCompatibility) {
 		v63ResetCount++;
 
 		applyPreStopEngineWorkarounds(v63ResetCount);
@@ -5724,7 +5862,7 @@ unsigned long Gen11::stopGraphicsEngine(void *that)
 
 	unsigned long ret = FunctionCast(stopGraphicsEngine, callback->ostopGraphicsEngine)(that);
 
-	if (!NGreen::callback->isRealTGL) {
+	if (rplCompatibility) {
 		// V53/V161 POST: snapshot after stop
 		SYSLOG("ngreen", "V53[%d] stop POST: RCS CTL=0x%x HEAD=0x%x TAIL=0x%x EXEC=0x%x",
 			v63ResetCount,
@@ -9342,6 +9480,13 @@ void Gen11::injectAcceleratorPersonality(bool useTglNames)
 	auto *mc  = OSString::withCString("IOAccelerator");
 	auto *pv  = OSString::withCString("IOPCIDevice");
 	auto *pcm = OSString::withCString("0x03000000&0xff000000");
+	/*
+	 * The class match encompasses every display controller, including the Yoga's
+	 * NVIDIA dGPU.  The active OpenCore profile presents this Intel iGPU as the
+	 * established 9A49 donor persona; retain 46A6 as a physical-identity fallback
+	 * without changing either PCI identity.
+	 */
+	auto *pdm = OSString::withCString("0x9a498086 0x46a68086");
 	auto *ps  = OSNumber::withNumber(static_cast<unsigned long long>(1000), 32);
 
 	dict->setObject("CFBundleIdentifier", bi);
@@ -9349,6 +9494,7 @@ void Gen11::injectAcceleratorPersonality(bool useTglNames)
 	dict->setObject("IOMatchCategory", mc);
 	dict->setObject("IOProviderClass", pv);
 	dict->setObject("IOPCIClassMatch", pcm);
+	dict->setObject("IOPCIPrimaryMatch", pdm);
 	dict->setObject("IOProbeScore", ps);
 
 	OSSafeReleaseNULL(bi);
@@ -9356,6 +9502,7 @@ void Gen11::injectAcceleratorPersonality(bool useTglNames)
 	OSSafeReleaseNULL(mc);
 	OSSafeReleaseNULL(pv);
 	OSSafeReleaseNULL(pcm);
+	OSSafeReleaseNULL(pdm);
 	OSSafeReleaseNULL(ps);
 
 	// V44: GPU driver bundle names — required by IOAcceleratorFamily2 and WindowServer
