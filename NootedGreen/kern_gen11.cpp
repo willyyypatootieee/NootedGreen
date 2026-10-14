@@ -1074,6 +1074,11 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		 */
 		const bool adlpSequoiaAdmission = sequoiaAdlpBaseline &&
 			checkKernelArgument("-ngreenadlpadmit");
+		// This is intentionally a second opt-in.  Admission establishes the normal
+		// IOKit match attempt; publication tracing only records whether that match
+		// actually enters and returns from the donor's native start implementation.
+		const bool adlpSequoiaPublicationTrace = adlpSequoiaAdmission &&
+			checkKernelArgument("-ngreenadlppubtrace");
 		if (sequoiaAdlpBaseline && !adlpSequoiaAdmission) {
 			SYSLOG("ADLP", "Sequoia baseline: TGL accelerator reached; catalog personality and MMIO mapping withheld");
 		} else {
@@ -1259,6 +1264,17 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				SYSLOG("ngreen", "V44: Hooked IntelAccelerator::start");
 			} else {
 				SYSLOG("ngreen", "V44: IntelAccelerator::start symbol not found; Gen11::start logs unavailable on this build");
+			}
+		} else if (adlpSequoiaPublicationTrace) {
+			RouteRequestPlus traceStartRoute[] = {
+				{"__ZN16IntelAccelerator5startEP9IOService", adlpTraceIntelAcceleratorStart,
+					this->oAdlpTraceIntelAcceleratorStart},
+			};
+			if (RouteRequestPlus::routeAll(patcher, index, traceStartRoute, address, size)) {
+				SYSLOG("ADLP-TRACE", "publication trace armed: native IntelAccelerator::start will be observed without behavioural changes");
+			} else {
+				patcher.clearError();
+				SYSLOG("ADLP-TRACE", "publication trace NOT armed: IntelAccelerator::start symbol was unavailable");
 			}
 		} else if (adlpSequoiaAdmission) {
 			SYSLOG("ADLP", "admission-only: IntelAccelerator::start left native; legacy non-TGL MMIO/reset/IRQ wrapper withheld");
@@ -4054,6 +4070,35 @@ int Gen11::wrapHwSetupMemory(AppleIntel::AppleIntelBaseController *that, AppleIn
 
 static void v44ScheduleBundleLog(void *accelInstance, unsigned delayMs);
 static void v45ScheduleDelayedCheck(void *accelInstance, unsigned delayMs);
+
+unsigned long Gen11::adlpTraceIntelAcceleratorStart(void *that, void *provider)
+{
+	// This wrapper exists solely to distinguish a catalogue insertion from a
+	// successful provider match.  Do not add device configuration or workarounds
+	// here: the admission trace must execute the donor start path unchanged.
+	auto *service = static_cast<IOService *>(that);
+	auto *providerService = static_cast<IOService *>(provider);
+	const char *serviceName = service ? service->getName() : "<null>";
+	const char *providerName = providerService ? providerService->getName() : "<null>";
+	const char *providerClass = (providerService && providerService->getMetaClass()) ?
+		providerService->getMetaClass()->getClassName() : "<null>";
+	const uint64_t beforeState = service ? service->getState() : 0;
+
+	SYSLOG("ADLP-TRACE", "IntelAccelerator::start ENTER service=%s provider=%s class=%s state=0x%llx",
+		serviceName, providerName, providerClass, (unsigned long long)beforeState);
+
+	auto ret = FunctionCast(adlpTraceIntelAcceleratorStart,
+		callback->oAdlpTraceIntelAcceleratorStart)(that, provider);
+
+	const uint64_t afterState = service ? service->getState() : 0;
+	auto *actualProvider = service ? service->getProvider() : nullptr;
+	const char *actualProviderName = actualProvider ? actualProvider->getName() : "<null>";
+	const char *actualProviderClass = (actualProvider && actualProvider->getMetaClass()) ?
+		actualProvider->getMetaClass()->getClassName() : "<null>";
+	SYSLOG("ADLP-TRACE", "IntelAccelerator::start RETURN ret=%lu service-state=0x%llx provider=%s class=%s",
+		ret, (unsigned long long)afterState, actualProviderName, actualProviderClass);
+	return ret;
+}
 
 unsigned long Gen11::start(void *that,void  *param_1)
 {

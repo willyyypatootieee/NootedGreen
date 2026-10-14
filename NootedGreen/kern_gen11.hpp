@@ -1921,6 +1921,13 @@ private:
 	// registerService() so IOKit can match IntelAccelerator. Idempotent.
 	void injectAcceleratorPersonality(bool useTglNames);
 	bool acceleratorPersonalityInjected {false};
+
+	// ADL-P / Sequoia diagnostic-only start wrapper.  It is enabled only by the
+	// separate -ngreenadlppubtrace argument in addition to -ngreenadlpadmit.  It
+	// observes the native IntelAccelerator start call and does not modify MMIO,
+	// service properties, return values, or recovery behaviour.
+	static unsigned long adlpTraceIntelAcceleratorStart(void *that, void *provider);
+	mach_vm_address_t oAdlpTraceIntelAcceleratorStart {};
 	
 	
 	static void * AppleIntelPlanenew(unsigned long param_1);
