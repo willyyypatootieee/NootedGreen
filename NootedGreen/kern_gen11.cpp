@@ -1237,9 +1237,11 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				SYSLOG("ngreen", "V212: RPL watchdog routes unavailable");
 			}
 		} else if (NGreen::callback->isAlderLakeP()) {
-			SYSLOG("ADLP", sequoiaAdlpBaseline
-				? "V212 RPL watchdog routes intentionally disabled on Sequoia baseline"
-				: "V212 RPL watchdog routes intentionally disabled on ADL-P");
+			if (sequoiaAdlpBaseline) {
+				SYSLOG("ADLP", "V212 RPL watchdog routes intentionally disabled on Sequoia baseline");
+			} else {
+				SYSLOG("ADLP", "V212 RPL watchdog routes intentionally disabled on ADL-P");
+			}
 		}
 
 		/*
@@ -1290,9 +1292,11 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				SYSLOG("ngreen", "V111: IGAccelDevice::deviceStart symbol not found — relying on binary patch");
 			}
 		} else if (NGreen::callback->isAlderLakeP()) {
-			SYSLOG("ADLP", sequoiaAdlpBaseline
-				? "V111 RPL force-success hook intentionally disabled on Sequoia baseline"
-				: "V111 RPL force-success hook intentionally disabled on ADL-P");
+			if (sequoiaAdlpBaseline) {
+				SYSLOG("ADLP", "V111 RPL force-success hook intentionally disabled on Sequoia baseline");
+			} else {
+				SYSLOG("ADLP", "V111 RPL force-success hook intentionally disabled on ADL-P");
+			}
 		}
 
 		if (!sequoiaAdlpBaseline && (!wegCoexist || forceFullMTL)) {
